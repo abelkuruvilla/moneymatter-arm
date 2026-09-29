@@ -1,0 +1,105 @@
+# Builds arm64 images of MoneyMatter (upstream only publishes amd64) and pushes
+# them to GHCR, then tells Dokploy to redeploy.
+#
+# Put this at .github/workflows/build-arm64.yml in a small repo of your own
+# (e.g. moneymatter-arm). It checks out upstream letehaha/moneymatter@main,
+# the same branch upstream builds its :latest images from, on GitHub's native
+# arm64 runners (no QEMU, so a build takes minutes, not an hour).
+#
+# Repo secrets:
+#   DOKPLOY_DEPLOY_WEBHOOK  (optional) Dokploy compose -> Deployments -> Webhook URL
+#
+# Make the two GHCR packages public after the first run (Package settings ->
+# Change visibility), or add GHCR credentials to Dokploy as a registry.
+
+name: Build MoneyMatter arm64
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 9 * * *' # daily; a run with no new upstream commit exits early
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM: letehaha/moneymatter
+  UPSTREAM_REF: main
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+      short: ${{ steps.sha.outputs.short }}
+      build: ${{ steps.exists.outputs.build }}
+    steps:
+      - id: sha
+        run: |
+          SHA=$(git ls-remote "https://github.com/${UPSTREAM}.git" "refs/heads/${UPSTREAM_REF}" | cut -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: exists
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && \
+             docker manifest inspect "ghcr.io/${OWNER}/moneymatter-be:sha-${{ steps.sha.outputs.short }}" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"; echo "Already built ${{ steps.sha.outputs.short }}"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      matrix:
+        include:
+          - image: moneymatter-be
+            dockerfile: self-hosting/backend/Dockerfile
+          - image: moneymatter-fe
+            dockerfile: self-hosting/frontend/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.sha }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: owner
+        run: echo "lc=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/arm64
+          push: true
+          build-args: |
+            VITE_APP_COMMIT_HASH=${{ needs.check.outputs.sha }}
+          tags: |
+            ghcr.io/${{ steps.owner.outputs.lc }}/${{ matrix.image }}:latest
+            ghcr.io/${{ steps.owner.outputs.lc }}/${{ matrix.image }}:sha-${{ needs.check.outputs.short }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Dokploy redeploy
+        env:
+          HOOK: ${{ secrets.DOKPLOY_DEPLOY_WEBHOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then echo "No webhook set; skipping"; exit 0; fi
+          curl -fsS -X POST "$HOOK"
